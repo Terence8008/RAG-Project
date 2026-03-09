@@ -1,12 +1,9 @@
 import Groq from "groq-sdk";
 import { NextRequest, NextResponse } from "next/server";
-import { formatContext, isRelevant } from "@/lib/retriever";
-import { RetrievedChunk } from "@/lib/types";
+import { retrieve, formatContext, isRelevant } from "@/lib/retriever";
 
-/**
- * Groq client is instantiated once at module level — not inside the handler.
- */
 const groq = new Groq();
+
 const SYSTEM_PROMPT = `You are a precise document analyst. Your job is to answer questions strictly using the provided document context.
 
 Rules:
@@ -18,23 +15,18 @@ Rules:
 - Never speculate or infer beyond what the context explicitly states.`;
 
 /**
- * Request body shape.
- * Typed explicitly so TypeScript catches malformed requests at compile time.
+ * Request body — simplified.
+ * We no longer receive pre-retrieved chunks from the client.
+ * The server now handles retrieval using the documentId.
  */
 interface ChatRequestBody {
   question: string;
-  chunks: RetrievedChunk[];
+  documentId: string;
   history: { role: "user" | "assistant"; content: string }[];
 }
 
-/**
- * POST /api/chat
- *
- * Receives a question + pre-retrieved chunks from the client.
- * Builds the prompt, calls Groq, and streams the response back.
- */
 export async function POST(req: NextRequest) {
-  // ── 1. Parse and validate the request body ──────────────────────────────
+  // ── 1. Parse and validate ────────────────────────────────────────────────
   let body: ChatRequestBody;
 
   try {
@@ -46,7 +38,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { question, chunks, history } = body;
+  const { question, documentId, history } = body;
 
   if (!question?.trim()) {
     return NextResponse.json(
@@ -55,71 +47,81 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  if (!Array.isArray(chunks)) {
+  if (!documentId) {
     return NextResponse.json(
-      { error: "chunks must be an array." },
+      { error: "documentId is required." },
       { status: 400 }
     );
   }
 
-  //Relevance guard 
+  // ── 2. Retrieve relevant chunks server-side ──────────────────────────────
   /**
-   * If retrieval found nothing relevant, short-circuit here.
-   * Don't even call Groq save the API call and give the user
-   * a clear message instead of a hallucinated answer.
+   * Retrieval now happens here, not on the client.
+   * The client only sends the question and documentId.
+   * This keeps embeddings and Supabase queries server-side.
    */
-  const bestScore = chunks[0]?.score ?? 0;
-  const contextNote = bestScore < 0.05
-    ? "\n\nNote: Retrieved context may not directly answer this question."
-    : "";
+  let chunks;
+  try {
+    chunks = await retrieve(question, documentId);
+  } catch (err) {
+    console.error("[/api/chat] Retrieval error:", err);
+    return NextResponse.json(
+      { error: "Failed to retrieve context. Please try again." },
+      { status: 500 }
+    );
+  }
 
+  // ── 3. Relevance guard ───────────────────────────────────────────────────
+  if (!isRelevant(chunks)) {
+    return NextResponse.json(
+      {
+        error:
+          "No relevant content found in the document for this question. Try rephrasing or ask something covered in the document.",
+        chunks,         // Return chunks so the client can show source scores
+      },
+      { status: 200 }
+    );
+  }
 
-  //  Build the context block 
-  const context = formatContext(chunks) + contextNote;
+  // ── 4. Build context and messages ───────────────────────────────────────
+  const context = formatContext(chunks);
 
-  //Build the message history 
-  /**
-   * We include the last 6 messages (3 turns) of history for conversational
-   * context. Including everything would bloat the prompt unnecessarily.
-   */
   const messages: Groq.Chat.ChatCompletionMessageParam[] = [
-    // System prompt goes first, inside messages — not as a separate parameter
-    {
-        role: "system",
-        content: SYSTEM_PROMPT,
-    },
-    // Previous conversation turns (capped at last 6)
+    { role: "system", content: SYSTEM_PROMPT },
     ...history.slice(-6).map((m) => ({
-        role: m.role,
-        content: m.content,
+      role: m.role,
+      content: m.content,
     })),
-    // Current question with fresh context injected
     {
-        role: "user" as const,
-        content: `DOCUMENT CONTEXT:\n${context}\n\nQUESTION: ${question}`,
+      role: "user" as const,
+      content: `DOCUMENT CONTEXT:\n${context}\n\nQUESTION: ${question}`,
     },
-    ];
+  ];
 
-    // Call Groq with streaming 
-    try {
+  // ── 5. Stream response ───────────────────────────────────────────────────
+  try {
     const stream = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages,
-        temperature: 0,
-        max_tokens: 1024,
-        stream: true,
+      model: "llama-3.3-70b-versatile",
+      messages,
+      temperature: 0,
+      max_tokens: 1024,
+      stream: true,
     });
 
-    //Stream the response back to the client 
-    /**
-     * TransformStream bridges Groq's async iterator to the Web Streams API
-     * that Next.js Response expects.
-     */
     const encoder = new TextEncoder();
 
+    /**
+     * We prefix the stream with a JSON metadata line containing the chunks.
+     * This lets the client show source citations without a separate API call.
+     * Format: first line is JSON metadata, rest is the streamed answer.
+     */
     const readable = new ReadableStream({
       async start(controller) {
         try {
+          // Send chunk metadata first so UI can show sources immediately
+          const meta = JSON.stringify({ chunks }) + "\n";
+          controller.enqueue(encoder.encode(meta));
+
           for await (const chunk of stream) {
             const token = chunk.choices[0]?.delta?.content ?? "";
             if (token) {
@@ -137,16 +139,12 @@ export async function POST(req: NextRequest) {
     return new Response(readable, {
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
-        // Tells the browser this is a stream — don't buffer, render immediately
         "X-Content-Type-Options": "nosniff",
-        // Prevents Vercel/CDN from caching streamed responses
         "Cache-Control": "no-cache",
       },
     });
   } catch (error) {
-    // Groq API errors — rate limit, invalid key, model unavailable, etc.
     console.error("[/api/chat] Groq error:", error);
-
     return NextResponse.json(
       { error: "Failed to generate a response. Please try again." },
       { status: 500 }

@@ -1,9 +1,8 @@
 "use client";
 import { useState, useRef } from "react";
 import { DocumentRecord, Message } from "@/lib/types";
-import { createDocument } from "@/lib/vectorStore";
-import { extractText } from "@/lib/chunker";
-import { retrieve } from "@/lib/retriever";
+import { extractText } from "@/lib/extractor";
+import { RetrievedChunk } from "@/lib/types";
 import UploadZone from "@/components/UploadZone";
 import Sidebar from "@/components/Sidebar";
 import ChatThread from "@/components/ChatThread";
@@ -30,35 +29,57 @@ export default function Home() {
    * All of this runs in the browser. Nothing is sent to the server yet.
    */
   async function handleFileUpload(file: File) {
-    console.log("=== HANDLE FILE UPLOAD CALLED ===");
-    console.log("File:", file.name);
     setIsProcessing(true);
     try {
       const rawText = await extractText(file);
-      console.log("Extracted text length:", rawText.length);
-      console.log("Sample:", rawText.slice(0, 200));
-      const doc = createDocument(
-        crypto.randomUUID(),
-        file.name,
-        parseFloat((file.size / 1024).toFixed(1)),
-        rawText
-      );
-      setDocs((prev) => [...prev, doc]);
-      setActiveDoc(doc);
+      const sizeKb = parseFloat((file.size / 1024).toFixed(1));
+
+      const res = await fetch("/api/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: file.name, sizeKb, rawText }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error ?? "Ingestion failed.");
+      }
+
+      const doc = await res.json();
+
+      setDocs((prev) => [
+        ...prev,
+        {
+          id: doc.id,
+          name: doc.name,
+          sizeKb: doc.sizeKb,
+          chunks: [],
+          vocab: [],
+          createdAt: new Date(doc.createdAt),
+        },
+      ]);
+
+      setActiveDoc({
+        id: doc.id,
+        name: doc.name,
+        sizeKb: doc.sizeKb,
+        chunks: [],
+        vocab: [],
+        createdAt: new Date(doc.createdAt),
+      });
+
       setMessages([
         {
           role: "assistant",
-          content: `**${file.name}** is ready.\n\n📄 ${rawText.length.toLocaleString()} characters split into **${doc.chunks.length} chunks** and indexed.\n\nAsk me anything about this document.`,
+          content: `**${doc.name}** is ready.\n\n📄 ${rawText.length.toLocaleString()} characters split into **${doc.chunkCount} chunks** and indexed.\n\nAsk me anything about this document.`,
         },
       ]);
     } catch (err) {
-      // Make the full error visible
-      console.error("=== EXTRACTION ERROR ===");
-      console.error(err);
+      console.error("=== INGESTION ERROR ===", err);
       setMessages([
         {
           role: "assistant",
-          content: `⚠️ ${err instanceof Error ? err.message : "Failed to process file."}`,
+          content: `${err instanceof Error ? err.message : "Failed to process file."}`,
         },
       ]);
     } finally {
@@ -66,32 +87,19 @@ export default function Home() {
     }
   }
 
-  // ── Chat ───────────────────────────────────────────────────────────────
+  // Chat 
   async function handleSend(question: string) {
     if (!activeDoc || isStreaming) return;
 
-    // Append user message immediately for responsive feel
     const userMessage: Message = { role: "user", content: question };
     const updatedMessages = [...messages, userMessage];
     setMessages(updatedMessages);
     setIsStreaming(true);
 
-    // Retrieve relevant chunks client-side
-    const chunks = retrieve(question, activeDoc);
-
-    console.log("=== RAG DEBUG ===");
-    console.log("Doc name:", activeDoc.name);
-    console.log("Total chunks:", activeDoc.chunks.length);
-    console.log("Vocab size:", activeDoc.vocab.length);
-    console.log("Top 4 scores:", chunks.map(c => c.score.toFixed(4)));
-    console.log("Sample chunk text:", activeDoc.chunks[0]?.text.slice(0, 100));
-    console.log("=================");
-
-    // Placeholder assistant message — we'll stream into this
     const assistantMessage: Message = {
       role: "assistant",
       content: "",
-      sources: chunks,
+      sources: [],
     };
     setMessages([...updatedMessages, assistantMessage]);
 
@@ -103,36 +111,33 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
-          chunks,
+          documentId: activeDoc.id,  // Send ID — server handles retrieval
           history: messages.slice(-6),
         }),
         signal: abortRef.current.signal,
       });
 
-      // Handle non-streaming error responses (validation, relevance guard)
-      if (!res.ok || res.headers.get("content-type")?.includes("application/json")) {
+      // Handle JSON error responses
+      if (res.headers.get("content-type")?.includes("application/json")) {
         const data = await res.json();
         setMessages((prev) => {
           const updated = [...prev];
           updated[updated.length - 1] = {
             ...assistantMessage,
             content: data.error ?? "Something went wrong.",
+            sources: data.chunks ?? [],
           };
           return updated;
         });
         return;
       }
 
-      /**
-       * Stream reading — we read the response body chunk by chunk
-       * and append each token to the last message in state.
-       *
-       * This is why the assistant message starts with content: "" —
-       * we mutate it in place as tokens arrive.
-       */
+      // Read the stream
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let accumulated = "";
+      let metaParsed = false;
+      let sources: RetrievedChunk[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -140,11 +145,30 @@ export default function Home() {
 
         accumulated += decoder.decode(value, { stream: true });
 
+        /**
+         * First line of the stream is JSON metadata containing sources.
+         * We parse it once, then treat everything after as the answer text.
+         */
+        if (!metaParsed && accumulated.includes("\n")) {
+          const newlineIndex = accumulated.indexOf("\n");
+          const metaLine = accumulated.slice(0, newlineIndex);
+          accumulated = accumulated.slice(newlineIndex + 1);
+          metaParsed = true;
+
+          try {
+            const meta = JSON.parse(metaLine);
+            sources = meta.chunks ?? [];
+          } catch {
+            // If meta parse fails, treat everything as content
+          }
+        }
+
         setMessages((prev) => {
           const updated = [...prev];
           updated[updated.length - 1] = {
             ...assistantMessage,
             content: accumulated,
+            sources,
           };
           return updated;
         });
@@ -155,7 +179,7 @@ export default function Home() {
         const updated = [...prev];
         updated[updated.length - 1] = {
           ...assistantMessage,
-          content: "⚠️ Failed to reach the server. Check your connection.",
+          content: " Failed to reach the server. Check your connection.",
         };
         return updated;
       });
@@ -183,7 +207,7 @@ export default function Home() {
     }
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────
+  // ── Render
   return (
     <div className="flex h-screen overflow-hidden">
       {/* Sidebar — document list */}

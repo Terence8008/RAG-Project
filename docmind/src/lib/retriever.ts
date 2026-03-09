@@ -1,94 +1,85 @@
-import { Chunk, DocumentRecord, RetrievedChunk } from "./types";
+/**
+ * This module runs SERVER-SIDE ONLY.
+ * It handles embedding the query and searching Supabase.
+ * Previous architecture: client retrieves → sends chunks to server
+ * New architecture:      client sends question → server retrieves + generates
+ */
+
+import { createClient } from "@supabase/supabase-js";
+import { embedQuery } from "./embeddings";
+import { SupabaseChunkMatch, RetrievedChunk } from "./types";
 
 /**
- * Cosine similarity between two vectors.
- * Returns a value between -1 and 1. In practice with TF-IDF (no negatives)
- * it's always 0–1. 1 = identical direction, 0 = completely unrelated.
+ * Server-side Supabase client.
+ * Uses the service role key for elevated permissions if needed,
+ * or anon key if RLS is disabled (portfolio setup).
  */
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
+function getServerSupabaseClient() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY;
 
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] ** 2;
-    normB += b[i] ** 2;
+  if (!url || !key) {
+    throw new Error(
+      "Supabase environment variables are not set on the server."
+    );
   }
 
-  // Guard against division by zero (zero vectors = empty/stopword-only chunks)
-  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
-  if (denominator === 0) return 0;
-
-  return dot / denominator;
+  return createClient(url, key);
 }
 
 /**
- * Vectorizes the user's query using the same vocab and TF-IDF logic
- * that was used to index the document.
- */
-function vectorizeQuery(query: string, vocab: string[]): number[] {
-  const stopWords = new Set([
-    "the", "is", "at", "which", "on", "a", "an", "and", "or", "but",
-    "in", "with", "to", "of", "for", "as", "by", "from", "it", "its",
-    "this", "that", "was", "are", "be", "been", "has", "have", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may",
-    "not", "no", "so", "if", "then", "than", "also", "into", "about",
-  ]);
-
-  const words = (query.toLowerCase().match(/\b[a-z]\w+\b/g) || []).filter(
-    (w) => !stopWords.has(w) && w.length > 2
-  );
-
-  const wordCount = words.length || 1;
-
-  // TF only for the query — no IDF needed here because the query is a
-  // single "document". We just want term frequency relative to its length.
-  const tf: Record<string, number> = {};
-  words.forEach((w) => { tf[w] = (tf[w] || 0) + 1; });
-
-  return vocab.map((term) => (tf[term] || 0) / wordCount);
-}
-
-/**
- * Retrieves the top-K most relevant chunks for a given query.
+ * Retrieves the most semantically relevant chunks for a query.
  *
- * This is the core retrieval step of RAG:
- * 1. Vectorize the query in the document's vocab space
- * 2. Score every chunk via cosine similarity
- * 3. Sort descending and take the top K
- * 4. Filter out chunks with near-zero scores (irrelevant noise)
+ * Pipeline:
+ * 1. Embed the query using the same model used at indexing time
+ * 2. Call the match_chunks Postgres function via Supabase RPC
+ * 3. Return ranked results with similarity scores
  *
- * @param query     - The user's question
- * @param document  - The indexed DocumentRecord to search
- * @param topK      - How many chunks to return (default 4)
- * @param threshold - Minimum score to include a chunk (default 0.01)
+ * Why RPC instead of a raw Supabase query?
+ * The pgvector similarity search requires a custom SQL function.
+ * Supabase's JS client can't express "<=> operator" queries directly,
+ * but it can call Postgres functions via .rpc() — clean and type-safe.
  */
-export function retrieve(
-  query: string,
-  document: DocumentRecord,
-  topK: number = 4,
-  threshold: number = 0.01
-): RetrievedChunk[] {
-  const queryVector = vectorizeQuery(query, document.vocab);
+export async function retrieve(
+    query: string,
+    documentId: string,
+    topK: number = 4,
+    threshold: number = 0.1
+  ): Promise<RetrievedChunk[]> {
+    const queryEmbedding = await embedQuery(query);
 
-  const scored: RetrievedChunk[] = document.chunks.map((chunk) => ({
-    ...chunk,
-    score: cosineSimilarity(queryVector, chunk.vector),
-  }));
+    console.log("Query embedding length:", queryEmbedding.length);
+    console.log("Document ID being searched:", documentId);
+    console.log("Threshold:", threshold);
 
-  const results = scored
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+    const supabase = getServerSupabaseClient();
 
-  console.log("Top scores:", results.map(c => c.score.toFixed(6)));
+    const { data, error } = await supabase.rpc("match_chunks", {
+      query_embedding: queryEmbedding,
+      match_document_id: documentId,
+      match_count: topK,
+      match_threshold: threshold,
+    });
 
-  return results;
-}
+    console.log("RPC error:", error);
+    console.log("RPC data:", data);
+
+    if (error) {
+      throw new Error(`Retrieval failed: ${error.message}`);
+    }
+
+    return (data ?? []).map((match: SupabaseChunkMatch) => ({
+      id: match.chunk_index,
+      text: match.content,
+      vector: [],
+      score: match.similarity,
+    }));
+  }
+
 /**
- * Formats retrieved chunks into a context block for the LLM prompt. So the model can reference them specifically.
+ * Formats retrieved chunks into a labeled context block for the LLM.
+ * Unchanged from before — the output shape is the same regardless of
+ * whether retrieval was TF-IDF or vector-based.
  */
 export function formatContext(chunks: RetrievedChunk[]): string {
   if (chunks.length === 0) {
@@ -104,9 +95,11 @@ export function formatContext(chunks: RetrievedChunk[]): string {
 }
 
 /**
- * Decides whether the retrieved chunks are relevant enough to answer.
+ * Relevance guard — unchanged logic, different threshold.
+ * 0.3 is appropriate for cosine similarity with MiniLM embeddings.
+ * TF-IDF used 0.05 because its scores are much lower by nature.
  */
 export function isRelevant(chunks: RetrievedChunk[]): boolean {
   if (chunks.length === 0) return false;
-  return chunks[0].score >= 0.05;
+  return chunks[0].score >= 0.3;
 }
