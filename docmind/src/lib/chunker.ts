@@ -1,5 +1,3 @@
-// src/lib/chunker.ts
-
 "use client";
 
 import { Chunk } from "./types";
@@ -67,16 +65,6 @@ async function extractPdfText(file: File): Promise<string> {
   /**
    * Fix character-spread encoding at the string level.
    *
-   * The pattern "C O M P U T E R" appears in PDFs from design tools
-   * (Canva, InDesign) where each glyph is a separate text span.
-   * When joined they become "C O M P U T E R S C I E N C E".
-   *
-   * Strategy: find sequences of single chars separated by single spaces
-   * and collapse them. We require 4+ chars to avoid collapsing
-   * legitimate single-letter words like "I" or "a".
-   *
-   * "C O M P U T E R" → "COMPUTER"
-   * But "I am a dev" → unchanged (words are longer than 1 char)
    */
   fullText = fullText.replace(
     /\b([A-Za-z] ){4,}[A-Za-z]\b/g,
@@ -86,8 +74,6 @@ async function extractPdfText(file: File): Promise<string> {
   /**
    * After collapsing char-spreads, add spaces between
    * concatenated words using camelCase-style boundary detection.
-   * "COMPUTERSCIENCESTUDENT" → we leave as-is (all caps, resume header)
-   * "PersonalProfile" → "Personal Profile"
    */
   fullText = fullText
     .replace(/([a-z])([A-Z])/g, "$1 $2")  // camelCase → camel Case
