@@ -13,6 +13,8 @@ const ACCEPTED_MIME = [
   "application/pdf",
   "text/csv",
   "application/json",
+  "application/x-pdf",
+  "", 
 ];
 
 export default function UploadZone({ onUpload, isProcessing }: Props) {
@@ -32,9 +34,18 @@ export default function UploadZone({ onUpload, isProcessing }: Props) {
   }
 
   function handleFile(file: File) {
+    console.log("=== FILE DEBUG ===");
+    console.log("Name:", file.name);
+    console.log("Type:", file.type);
+    console.log("Size:", file.size);
+    console.log("Extension:", file.name.split(".").pop()?.toLowerCase());
+    
     const err = validate(file);
+    console.log("Validation error:", err);
+    
     if (err) { setError(err); return; }
     setError(null);
+    console.log("Calling onUpload...");
     onUpload(file);
   }
 

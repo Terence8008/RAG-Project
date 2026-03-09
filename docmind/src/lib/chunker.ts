@@ -1,79 +1,104 @@
+// src/lib/chunker.ts
+
+"use client";
+
 import { Chunk } from "./types";
 
-/**
- * Splits raw text into overlapping chunks.
- */
 export function chunkText(
   text: string,
   chunkSize: number = 800,
   overlap: number = 150
 ): Omit<Chunk, "vector">[] {
-  // Normalize whitespace — multiple spaces, tabs, and newlines become single spaces.
   const normalized = text.replace(/\s+/g, " ").trim();
-
   const chunks: Omit<Chunk, "vector">[] = [];
   let i = 0;
 
   while (i < normalized.length) {
-    const text = normalized.slice(i, i + chunkSize);
-
-    if (text.length < 50 && chunks.length > 0) break;
-
-    chunks.push({ id: chunks.length, text });
-
+    const sliced = normalized.slice(i, i + chunkSize);
+    if (sliced.length < 50 && chunks.length > 0) break;
+    chunks.push({ id: chunks.length, text: sliced });
     i += chunkSize - overlap;
   }
 
   return chunks;
 }
 
-/**
- * Extracts plain text from different file types.
- */
 export async function extractText(file: File): Promise<string> {
-  const type = file.type;
+  const ext = file.name.split(".").pop()?.toLowerCase();
 
-  // Plain text, markdown, CSV, JSON just read as text
-  if (
-    type === "text/plain" ||
-    type === "text/markdown" ||
-    type === "text/csv" ||
-    type === "application/json"
-  ) {
+  if (["txt", "md", "csv", "json"].includes(ext ?? "")) {
     return await file.text();
   }
 
-  // For production probably need to use a proper PDF parser (pdf-parse, pdfjs-dist).
-  if (type === "application/pdf") {
+  if (ext === "pdf") {
     return await extractPdfText(file);
   }
 
-  throw new Error(`Unsupported file type: ${type}. Upload .txt, .md, .pdf, .csv, or .json`);
+  throw new Error(
+    `Unsupported file type. Upload .txt, .md, .pdf, .csv, or .json`
+  );
 }
 
 async function extractPdfText(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const raw = new TextDecoder("latin1").decode(bytes);
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
-  // Extract text between BT (Begin Text) and ET (End Text) PDF operators
-  const textBlocks = raw.match(/BT[\s\S]*?ET/g) || [];
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({
+    data: new Uint8Array(arrayBuffer),
+  }).promise;
 
-  const extracted = textBlocks
-    .join(" ")
-    // Tj and TJ are the PDF "show text" operators
-    .replace(/\(([^)]+)\)\s*Tj/g, "$1 ")
-    .replace(/\(([^)]+)\)\s*TJ/g, "$1 ")
-    // Strip non-printable characters
-    .replace(/[^\x20-\x7E\n]/g, " ")
+  const pageTexts: string[] = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+
+    const rawText = content.items
+      .filter((item) => "str" in item)
+      .map((item) => (item as { str: string }).str)
+      .join("");
+
+    pageTexts.push(rawText);
+  }
+
+  let fullText = pageTexts.join(" ");
+
+  /**
+   * Fix character-spread encoding at the string level.
+   *
+   * The pattern "C O M P U T E R" appears in PDFs from design tools
+   * (Canva, InDesign) where each glyph is a separate text span.
+   * When joined they become "C O M P U T E R S C I E N C E".
+   *
+   * Strategy: find sequences of single chars separated by single spaces
+   * and collapse them. We require 4+ chars to avoid collapsing
+   * legitimate single-letter words like "I" or "a".
+   *
+   * "C O M P U T E R" → "COMPUTER"
+   * But "I am a dev" → unchanged (words are longer than 1 char)
+   */
+  fullText = fullText.replace(
+    /\b([A-Za-z] ){4,}[A-Za-z]\b/g,
+    (match) => match.replace(/ /g, "")
+  );
+
+  /**
+   * After collapsing char-spreads, add spaces between
+   * concatenated words using camelCase-style boundary detection.
+   * "COMPUTERSCIENCESTUDENT" → we leave as-is (all caps, resume header)
+   * "PersonalProfile" → "Personal Profile"
+   */
+  fullText = fullText
+    .replace(/([a-z])([A-Z])/g, "$1 $2")  // camelCase → camel Case
     .replace(/\s+/g, " ")
     .trim();
 
-  if (extracted.length < 100) {
+  if (fullText.length < 50) {
     throw new Error(
-      "Could not extract text from this PDF. It may be scanned or image-based. Try a text-based PDF."
+      "Could not extract text from this PDF. It may be scanned or image-based."
     );
   }
 
-  return extracted;
+  return fullText;
 }

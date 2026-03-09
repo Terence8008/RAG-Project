@@ -79,12 +79,14 @@ export function retrieve(
     score: cosineSimilarity(queryVector, chunk.vector),
   }));
 
-  return scored
-    .filter((chunk) => chunk.score > threshold)
+  const results = scored
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
-}
 
+  console.log("Top scores:", results.map(c => c.score.toFixed(6)));
+
+  return results;
+}
 /**
  * Formats retrieved chunks into a context block for the LLM prompt. So the model can reference them specifically.
  */

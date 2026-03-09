@@ -30,9 +30,13 @@ export default function Home() {
    * All of this runs in the browser. Nothing is sent to the server yet.
    */
   async function handleFileUpload(file: File) {
+    console.log("=== HANDLE FILE UPLOAD CALLED ===");
+    console.log("File:", file.name);
     setIsProcessing(true);
     try {
       const rawText = await extractText(file);
+      console.log("Extracted text length:", rawText.length);
+      console.log("Sample:", rawText.slice(0, 200));
       const doc = createDocument(
         crypto.randomUUID(),
         file.name,
@@ -48,6 +52,9 @@ export default function Home() {
         },
       ]);
     } catch (err) {
+      // Make the full error visible
+      console.error("=== EXTRACTION ERROR ===");
+      console.error(err);
       setMessages([
         {
           role: "assistant",
@@ -71,6 +78,14 @@ export default function Home() {
 
     // Retrieve relevant chunks client-side
     const chunks = retrieve(question, activeDoc);
+
+    console.log("=== RAG DEBUG ===");
+    console.log("Doc name:", activeDoc.name);
+    console.log("Total chunks:", activeDoc.chunks.length);
+    console.log("Vocab size:", activeDoc.vocab.length);
+    console.log("Top 4 scores:", chunks.map(c => c.score.toFixed(4)));
+    console.log("Sample chunk text:", activeDoc.chunks[0]?.text.slice(0, 100));
+    console.log("=================");
 
     // Placeholder assistant message — we'll stream into this
     const assistantMessage: Message = {

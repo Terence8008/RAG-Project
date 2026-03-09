@@ -68,18 +68,14 @@ export async function POST(req: NextRequest) {
    * Don't even call Groq save the API call and give the user
    * a clear message instead of a hallucinated answer.
    */
-  if (!isRelevant(chunks)) {
-    return NextResponse.json(
-      {
-        error:
-          "No relevant content found in the document for this question. Try rephrasing or ask something covered in the document.",
-      },
-      { status: 200 } // 200 because this is an expected app state, not a server error
-    );
-  }
+  const bestScore = chunks[0]?.score ?? 0;
+  const contextNote = bestScore < 0.05
+    ? "\n\nNote: Retrieved context may not directly answer this question."
+    : "";
+
 
   //  Build the context block 
-  const context = formatContext(chunks);
+  const context = formatContext(chunks) + contextNote;
 
   //Build the message history 
   /**
