@@ -59,3 +59,6 @@ npm run dev
 ```bash
 cp supabase/schema.sql # run contents in Supabase SQL editor
 ```
+
+### Vercel Deployment 
+https://docmind-six.vercel.app
