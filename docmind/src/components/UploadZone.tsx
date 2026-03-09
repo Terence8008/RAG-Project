@@ -1,3 +1,4 @@
+"use client";
 import { useRef, useState, DragEvent, ChangeEvent } from "react";
 
 interface Props {

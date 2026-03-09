@@ -1,7 +1,4 @@
-// src/app/page.tsx
-
 "use client";
-
 import { useState, useRef } from "react";
 import { DocumentRecord, Message } from "@/lib/types";
 import { createDocument } from "@/lib/vectorStore";
